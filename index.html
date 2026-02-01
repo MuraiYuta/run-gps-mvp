@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="ja">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Run GPS MVP</title>
+  <style>
+    body { font-family: system-ui, sans-serif; padding: 16px; }
+    button { padding: 12px 16px; margin-right: 8px; }
+    .row { margin: 10px 0; }
+    pre { background: #f5f5f5; padding: 12px; overflow: auto; }
+  </style>
+</head>
+<body>
+  <h1>Run GPS MVP</h1>
+
+  <div class="row">
+    <button id="start">Start</button>
+    <button id="pause" disabled>Pause</button>
+    <button id="stop" disabled>Stop</button>
+  </div>
+
+  <div class="row"><b>Distance:</b> <span id="dist">0.000</span> km</div>
+  <div class="row"><b>Time:</b> <span id="time">00:00</span></div>
+  <div class="row"><b>Pace(avg):</b> <span id="pace">--:--</span> min/km</div>
+  <div class="row"><b>Accuracy:</b> <span id="acc">--</span> m</div>
+
+  <pre id="log"></pre>
+
+<script>
+(() => {
+  const $ = (id) => document.getElementById(id);
+
+  const btnStart = $("start");
+  const btnPause = $("pause");
+  const btnStop  = $("stop");
+
+  const elDist = $("dist");
+  const elTime = $("time");
+  const elPace = $("pace");
+  const elAcc  = $("acc");
+  const elLog  = $("log");
+
+  let watchId = null;
+  let running = false;
+  let paused = false;
+
+  let points = []; // {lat, lon, ts}
+  let totalMeters = 0;
+
+  let t0 = null;         // start timestamp
+  let pausedTotal = 0;   // total paused ms
+  let pauseStartedAt = null;
+  let timer = null;
+
+  function log(s) {
+    elLog.textContent = s + "\n" + elLog.textContent;
+  }
+
+  function fmtTime(sec) {
+    const m = Math.floor(sec / 60);
+    const s = sec % 60;
+    return String(m).padStart(2,"0") + ":" + String(s).padStart(2,"0");
+  }
+
+  function fmtPace(minPerKm) {
+    if (!isFinite(minPerKm) || minPerKm <= 0) return "--:--";
+    const m = Math.floor(minPerKm);
+    const s = Math.round((minPerKm - m) * 60);
+    return String(m).padStart(2,"0") + ":" + String(s).padStart(2,"0");
+  }
+
+  // Haversine distance (meters)
+  function distMeters(a, b) {
+    const R = 6371000;
+    const toRad = (d) => d * Math.PI / 180;
+    const dLat = toRad(b.lat - a.lat);
+    const dLon = toRad(b.lon - a.lon);
+    const lat1 = toRad(a.lat);
+    const lat2 = toRad(b.lat);
+
+    const x = Math.sin(dLat/2)**2 + Math.cos(lat1)*Math.cos(lat2)*Math.sin(dLon/2)**2;
+    return 2 * R * Math.asin(Math.sqrt(x));
+  }
+
+  function elapsedSec() {
+    if (!t0) return 0;
+    const now = Date.now();
+    const pausedMs = pausedTotal + (pauseStartedAt ? (now - pauseStartedAt) : 0);
+    return Math.max(0, Math.floor((now - t0 - pausedMs) / 1000));
+  }
+
+  function render() {
+    const km = totalMeters / 1000;
+    elDist.textContent = km.toFixed(3);
+
+    const sec = elapsedSec();
+    elTime.textContent = fmtTime(sec);
+
+    const min = sec / 60;
+    const pace = km > 0 ? (min / km) : Infinity;
+    elPace.textContent = fmtPace(pace);
+  }
+
+  function startTimer() {
+    if (timer) clearInterval(timer);
+    timer = setInterval(render, 500);
+  }
+
+  function stopTimer() {
+    if (timer) clearInterval(timer);
+    timer = null;
+  }
+
+  function onPos(pos) {
+    const { latitude, longitude, accuracy } = pos.coords;
+    elAcc.textContent = accuracy ? Math.round(accuracy) : "--";
+
+    // 精度が悪い点は捨てる（まずはザックリ）
+    if (accuracy && accuracy > 60) {
+      log(`skip (accuracy ${Math.round(accuracy)}m) lat=${latitude}, lon=${longitude}`);
+      return;
+    }
+
+    const p = { lat: latitude, lon: longitude, ts: pos.timestamp || Date.now() };
+    const last = points[points.length - 1];
+
+    if (last) {
+      const d = distMeters(last, p);
+      // ノイズで飛ぶのを軽く抑える（大ジャンプは捨てる）
+      if (d < 50) totalMeters += d;
+      else log(`jump ignored: ${d.toFixed(1)}m`);
+    }
+    points.push(p);
+
+    log(`ok acc=${Math.round(accuracy)}m lat=${latitude.toFixed(6)} lon=${longitude.toFixed(6)}`);
+    render();
+  }
+
+  function onErr(err) {
+    log(`ERROR: ${err.code} ${err.message}`);
+  }
+
+  function startWatch() {
+    if (!navigator.geolocation) {
+      log("Geolocation not supported.");
+      return;
+    }
+    watchId = navigator.geolocation.watchPosition(onPos, onErr, {
+      enableHighAccuracy: true,
+      maximumAge: 1000,
+      timeout: 10000
+    });
+  }
+
+  function stopWatch() {
+    if (watchId !== null) {
+      navigator.geolocation.clearWatch(watchId);
+      watchId = null;
+    }
+  }
+
+  btnStart.addEventListener("click", () => {
+    if (running) return;
+    running = true;
+    paused = false;
+
+    points = [];
+    totalMeters = 0;
+    t0 = Date.now();
+    pausedTotal = 0;
+    pauseStartedAt = null;
+
+    btnStart.disabled = true;
+    btnPause.disabled = false;
+    btnStop.disabled = false;
+
+    log("START");
+    startWatch();
+    startTimer();
+    render();
+  });
+
+  btnPause.addEventListener("click", () => {
+    if (!running) return;
+    paused = !paused;
+
+    if (paused) {
+      pauseStartedAt = Date.now();
+      btnPause.textContent = "Resume";
+      log("PAUSE");
+      stopWatch(); // まずは停止（後で改良可能）
+    } else {
+      pausedTotal += (Date.now() - pauseStartedAt);
+      pauseStartedAt = null;
+      btnPause.textContent = "Pause";
+      log("RESUME");
+      startWatch();
+    }
+  });
+
+  btnStop.addEventListener("click", () => {
+    if (!running) return;
+    running = false;
+
+    stopWatch();
+    stopTimer();
+    render();
+
+    btnStart.disabled = false;
+    btnPause.disabled = true;
+    btnStop.disabled = true;
+    btnPause.textContent = "Pause";
+
+    log("STOP");
+    log(`RESULT: ${(totalMeters/1000).toFixed(3)} km, ${fmtTime(elapsedSec())}`);
+  });
+})();
+</script>
+</body>
+</html>
